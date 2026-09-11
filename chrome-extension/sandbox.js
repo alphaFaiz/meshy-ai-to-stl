@@ -56,6 +56,7 @@ const readers = {
 };
 
 const typeCounts = { SCALAR: 1, VEC2: 2, VEC3: 3, VEC4: 4, MAT2: 4, MAT3: 9, MAT4: 16 };
+const textEncoder = new TextEncoder();
 
 function readGlb(buffer) {
   const bytes = new Uint8Array(buffer);
@@ -274,6 +275,384 @@ function glbToObj(buffer) {
   return new TextEncoder().encode(`${lines.join("\n")}\n`).buffer;
 }
 
+function sanitizeName(value, fallback) {
+  return String(value || fallback)
+    .replace(/[^a-z0-9_.-]+/gi, "_")
+    .replace(/^[._-]+|[._-]+$/g, "") || fallback;
+}
+
+function imageBytes(gltf, bin, imageIndex) {
+  const image = gltf.images?.[imageIndex];
+  if (!image) return null;
+
+  if (image.bufferView !== undefined) {
+    const bufferView = gltf.bufferViews[image.bufferView];
+    const start = bufferView.byteOffset || 0;
+    const end = start + bufferView.byteLength;
+    return { bytes: bin.slice(start, end), mimeType: image.mimeType };
+  }
+
+  if (typeof image.uri === "string" && image.uri.startsWith("data:")) {
+    const match = image.uri.match(/^data:([^;,]+)?(;base64)?,(.*)$/);
+    if (!match) return null;
+    const mimeType = match[1] || "application/octet-stream";
+    const payload = match[2] ? atob(match[3]) : decodeURIComponent(match[3]);
+    const bytes = new Uint8Array(payload.length);
+    for (let i = 0; i < payload.length; i++) bytes[i] = payload.charCodeAt(i);
+    return { bytes, mimeType };
+  }
+
+  return null;
+}
+
+function materialName(gltf, materialIndex) {
+  if (materialIndex === undefined || !gltf.materials?.[materialIndex]) return "material_default";
+  return `material_${materialIndex + 1}`;
+}
+
+async function bytesToPng(bytes, mimeType) {
+  if (mimeType === "image/png") return bytes;
+
+  const bitmap = await createImageBitmap(new Blob([bytes], { type: mimeType || "application/octet-stream" }));
+  const canvas = typeof OffscreenCanvas === "function"
+    ? new OffscreenCanvas(bitmap.width, bitmap.height)
+    : Object.assign(document.createElement("canvas"), { width: bitmap.width, height: bitmap.height });
+  const context = canvas.getContext("2d");
+  context.drawImage(bitmap, 0, 0);
+  bitmap.close?.();
+
+  const blob = canvas.convertToBlob
+    ? await canvas.convertToBlob({ type: "image/png" })
+    : await new Promise((resolve, reject) => canvas.toBlob((result) => result ? resolve(result) : reject(new Error("Could not encode PNG texture.")), "image/png"));
+  return new Uint8Array(await blob.arrayBuffer());
+}
+
+async function buildImageFiles(gltf, bin) {
+  const imageFiles = new Map();
+
+  for (let imageIndex = 0; imageIndex < (gltf.images || []).length; imageIndex++) {
+    const image = gltf.images[imageIndex];
+    const imageData = imageBytes(gltf, bin, imageIndex);
+    if (!imageData) continue;
+
+    const filename = `textures/${sanitizeName(image.name, `texture_${imageIndex + 1}`)}.png`;
+    const bytes = await bytesToPng(imageData.bytes, imageData.mimeType);
+    imageFiles.set(imageIndex, { filename, bytes });
+  }
+
+  return imageFiles;
+}
+
+async function buildTextureFiles(gltf, bin) {
+  const textureFiles = new Map();
+  const imageFiles = await buildImageFiles(gltf, bin);
+
+  for (let textureIndex = 0; textureIndex < (gltf.textures || []).length; textureIndex++) {
+    const texture = gltf.textures[textureIndex];
+    const imageFile = imageFiles.get(texture.source);
+    if (imageFile) textureFiles.set(textureIndex, imageFile);
+  }
+
+  if (!textureFiles.size) {
+    let fallbackIndex = 0;
+    for (const imageFile of imageFiles.values()) {
+      textureFiles.set(fallbackIndex++, imageFile);
+    }
+  }
+
+  return { textureFiles, imageFiles };
+}
+
+function materialTextureFile(textureFiles, textureInfo) {
+  return textureInfo?.index === undefined ? null : textureFiles.get(textureInfo.index);
+}
+
+function appendMtlMaterial(lines, name, material, textureFiles, fallbackTextureFile) {
+  const pbr = material?.pbrMetallicRoughness || {};
+  const specGloss = material?.extensions?.KHR_materials_pbrSpecularGlossiness || {};
+  const color = pbr.baseColorFactor || [1, 1, 1, 1];
+  const roughness = pbr.roughnessFactor ?? 1;
+  const metallic = pbr.metallicFactor ?? 0;
+  const baseColorTexture = materialTextureFile(textureFiles, pbr.baseColorTexture)
+    || materialTextureFile(textureFiles, specGloss.diffuseTexture)
+    || (material ? null : fallbackTextureFile);
+  const normalTexture = materialTextureFile(textureFiles, material?.normalTexture);
+  const occlusionTexture = materialTextureFile(textureFiles, material?.occlusionTexture);
+  const emissiveTexture = materialTextureFile(textureFiles, material?.emissiveTexture);
+  const metallicRoughnessTexture = materialTextureFile(textureFiles, pbr.metallicRoughnessTexture);
+  const emissive = material?.emissiveFactor || [0, 0, 0];
+
+  lines.push("");
+  lines.push(`newmtl ${name}`);
+  lines.push(`Ka ${color[0]} ${color[1]} ${color[2]}`);
+  lines.push(`Kd ${color[0]} ${color[1]} ${color[2]}`);
+  lines.push("Ks 0 0 0");
+  lines.push(`Ke ${emissive[0]} ${emissive[1]} ${emissive[2]}`);
+  lines.push(`d ${color[3] ?? 1}`);
+  lines.push(`Ns ${(1 - roughness) * 1000}`);
+  lines.push(`Pr ${roughness}`);
+  lines.push(`Pm ${metallic}`);
+  if (baseColorTexture) {
+    lines.push(`map_Ka ${baseColorTexture.filename}`);
+    lines.push(`map_Kd ${baseColorTexture.filename}`);
+  }
+  if (emissiveTexture) lines.push(`map_Ke ${emissiveTexture.filename}`);
+  if (normalTexture) lines.push(`norm ${normalTexture.filename}`);
+  if (occlusionTexture) lines.push(`map_Ka ${occlusionTexture.filename}`);
+  if (metallicRoughnessTexture) {
+    lines.push(`map_Pr ${metallicRoughnessTexture.filename}`);
+    lines.push(`map_Pm ${metallicRoughnessTexture.filename}`);
+  }
+}
+
+function buildMtl(gltf, textureFiles, fallbackTextureFile) {
+  const lines = ["# Converted from Meshy GLB"];
+
+  appendMtlMaterial(lines, "material_default", null, textureFiles, fallbackTextureFile);
+
+  (gltf.materials || []).forEach((material, index) => {
+    appendMtlMaterial(lines, `material_${index + 1}`, material, textureFiles, fallbackTextureFile);
+  });
+
+  return `${lines.join("\n")}\n`;
+}
+
+function baseColorTextureInfo(gltf, primitive) {
+  const material = gltf.materials?.[primitive.material];
+  const pbr = material?.pbrMetallicRoughness || {};
+  const specGloss = material?.extensions?.KHR_materials_pbrSpecularGlossiness || {};
+  return pbr.baseColorTexture || specGloss.diffuseTexture || null;
+}
+
+function textureCoordAttribute(gltf, primitive) {
+  const textureInfo = baseColorTextureInfo(gltf, primitive);
+  const transform = textureInfo?.extensions?.KHR_texture_transform;
+  const texCoord = transform?.texCoord ?? textureInfo?.texCoord ?? 0;
+  return primitive.attributes?.[`TEXCOORD_${texCoord}`] ?? primitive.attributes?.TEXCOORD_0;
+}
+
+function transformTextureCoord(uv, textureInfo) {
+  const transform = textureInfo?.extensions?.KHR_texture_transform;
+  if (!transform) return uv;
+
+  const offset = transform.offset || [0, 0];
+  const scale = transform.scale || [1, 1];
+  const rotation = transform.rotation || 0;
+  const cos = Math.cos(rotation);
+  const sin = Math.sin(rotation);
+  const u = uv[0] * scale[0];
+  const v = uv[1] * scale[1];
+  return [
+    offset[0] + cos * u - sin * v,
+    offset[1] + sin * u + cos * v,
+  ];
+}
+
+function materialDebugInfo(gltf, textureFiles) {
+  return {
+    materials: (gltf.materials || []).map((material, index) => {
+      const pbr = material.pbrMetallicRoughness || {};
+      const specGloss = material.extensions?.KHR_materials_pbrSpecularGlossiness || {};
+      const baseColorTexture = pbr.baseColorTexture || specGloss.diffuseTexture || null;
+      const textureFile = materialTextureFile(textureFiles, baseColorTexture);
+      return {
+        index,
+        objName: `material_${index + 1}`,
+        sourceName: material.name || null,
+        baseColorFactor: pbr.baseColorFactor || specGloss.diffuseFactor || null,
+        textureIndex: baseColorTexture?.index ?? null,
+        texCoord: baseColorTexture?.extensions?.KHR_texture_transform?.texCoord ?? baseColorTexture?.texCoord ?? 0,
+        textureTransform: baseColorTexture?.extensions?.KHR_texture_transform || null,
+        mapKd: textureFile?.filename || null,
+      };
+    }),
+    textures: (gltf.textures || []).map((texture, index) => ({
+      index,
+      source: texture.source ?? null,
+      file: textureFiles.get(index)?.filename || null,
+    })),
+  };
+}
+
+async function glbToTexturedObjFiles(buffer) {
+  const { json, bin } = readGlb(buffer);
+  const meshNodes = collectMeshNodes(json);
+  const { textureFiles, imageFiles } = await buildTextureFiles(json, bin);
+  const fallbackTextureFile = textureFiles.values().next().value || imageFiles.values().next().value || null;
+  const objLines = ["# Converted from Meshy GLB", "mtllib model.mtl"];
+  let vertexOffset = 0;
+  let texcoordOffset = 0;
+  let objectIndex = 0;
+
+  for (const { node, world } of meshNodes) {
+    const mesh = json.meshes[node.mesh];
+    for (let primitiveIndex = 0; primitiveIndex < (mesh.primitives || []).length; primitiveIndex++) {
+      const primitive = mesh.primitives[primitiveIndex];
+      if (primitive.mode !== undefined && primitive.mode !== 4) continue;
+      if (primitive.attributes?.POSITION === undefined) throw new Error("GLB is missing POSITION.");
+
+      const positions = accessorReader(json, bin, primitive.attributes.POSITION);
+      const textureInfo = baseColorTextureInfo(json, primitive);
+      const texcoordAttribute = textureCoordAttribute(json, primitive);
+      const texcoords = texcoordAttribute === undefined ? null : accessorReader(json, bin, texcoordAttribute);
+      const colors = primitive.attributes.COLOR_0 === undefined ? null : accessorReader(json, bin, primitive.attributes.COLOR_0);
+      const indices = primitive.indices === undefined ? null : accessorReader(json, bin, primitive.indices);
+      const objectName = sanitizeName(mesh.name || node.name, `mesh_${objectIndex + 1}`);
+      objLines.push("");
+      objLines.push(`o ${objectName}_${primitiveIndex + 1}`);
+      objLines.push(`usemtl ${materialName(json, primitive.material)}`);
+
+      for (let i = 0; i < positions.count; i++) {
+        const point = transform(world, positions.get(i));
+        if (colors && i < colors.count) {
+          const color = colors.get(i);
+          const alpha = color[3] ?? 1;
+          objLines.push(`v ${point[0]} ${point[1]} ${point[2]} ${color[0] * alpha} ${color[1] * alpha} ${color[2] * alpha}`);
+        } else {
+          objLines.push(`v ${point[0]} ${point[1]} ${point[2]}`);
+        }
+      }
+
+      if (texcoords) {
+        for (let i = 0; i < texcoords.count; i++) {
+          const uv = transformTextureCoord(texcoords.get(i), textureInfo);
+          objLines.push(`vt ${uv[0]} ${uv[1]}`);
+        }
+      }
+
+      const count = indices ? indices.count : positions.count;
+      for (let i = 0; i + 2 < count; i += 3) {
+        const face = [i, i + 1, i + 2].map((faceIndex) => {
+          const vertexIndex = indices ? indices.get(faceIndex)[0] : faceIndex;
+          const v = vertexIndex + vertexOffset + 1;
+          if (!texcoords || vertexIndex >= texcoords.count) return `${v}`;
+          const vt = vertexIndex + texcoordOffset + 1;
+          return `${v}/${vt}`;
+        });
+        objLines.push(`f ${face.join(" ")}`);
+      }
+
+      vertexOffset += positions.count;
+      texcoordOffset += texcoords?.count || 0;
+      objectIndex++;
+    }
+  }
+
+  if (!objectIndex) throw new Error("GLB does not contain triangle meshes.");
+
+  const files = [
+    { name: "model.obj", data: textEncoder.encode(`${objLines.join("\n")}\n`) },
+    { name: "model.mtl", data: textEncoder.encode(buildMtl(json, textureFiles, fallbackTextureFile)) },
+    { name: "debug-materials.json", data: textEncoder.encode(JSON.stringify(materialDebugInfo(json, textureFiles), null, 2)) },
+  ];
+
+  const addedTextures = new Set();
+  for (const textureFile of imageFiles.values()) {
+    if (addedTextures.has(textureFile.filename)) continue;
+    addedTextures.add(textureFile.filename);
+    files.push({ name: textureFile.filename, data: textureFile.bytes });
+  }
+
+  return files;
+}
+
+async function glbToPngTextureFiles(buffer) {
+  const { json, bin } = readGlb(buffer);
+  const imageFiles = await buildImageFiles(json, bin);
+  const files = [];
+  for (const file of imageFiles.values()) {
+    files.push({ name: file.filename, data: file.bytes });
+  }
+  if (!files.length) throw new Error("No embedded texture images were found in the decoded GLB.");
+  return files;
+}
+
+function crc32(bytes) {
+  let crc = -1;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let i = 0; i < 8; i++) {
+      crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+    }
+  }
+  return (crc ^ -1) >>> 0;
+}
+
+function concatBytes(parts) {
+  const total = parts.reduce((sum, part) => sum + part.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
+}
+
+function zipFiles(files) {
+  const localParts = [];
+  const centralParts = [];
+  let offset = 0;
+
+  function writeHeader(length) {
+    const bytes = new Uint8Array(length);
+    return { bytes, view: new DataView(bytes.buffer) };
+  }
+
+  for (const file of files) {
+    const name = textEncoder.encode(file.name);
+    const data = file.data instanceof Uint8Array ? file.data : new Uint8Array(file.data);
+    const crc = crc32(data);
+    const local = writeHeader(30 + name.length);
+    local.view.setUint32(0, 0x04034b50, true);
+    local.view.setUint16(4, 20, true);
+    local.view.setUint16(8, 0, true);
+    local.view.setUint16(10, 0, true);
+    local.view.setUint32(14, crc, true);
+    local.view.setUint32(18, data.length, true);
+    local.view.setUint32(22, data.length, true);
+    local.view.setUint16(26, name.length, true);
+    local.bytes.set(name, 30);
+    localParts.push(local.bytes, data);
+
+    const central = writeHeader(46 + name.length);
+    central.view.setUint32(0, 0x02014b50, true);
+    central.view.setUint16(4, 20, true);
+    central.view.setUint16(6, 20, true);
+    central.view.setUint16(10, 0, true);
+    central.view.setUint16(12, 0, true);
+    central.view.setUint32(16, crc, true);
+    central.view.setUint32(20, data.length, true);
+    central.view.setUint32(24, data.length, true);
+    central.view.setUint16(28, name.length, true);
+    central.view.setUint32(42, offset, true);
+    central.bytes.set(name, 46);
+    centralParts.push(central.bytes);
+
+    offset += local.bytes.length + data.length;
+  }
+
+  const centralOffset = offset;
+  const centralBytes = concatBytes(centralParts);
+  const end = writeHeader(22);
+  end.view.setUint32(0, 0x06054b50, true);
+  end.view.setUint16(8, files.length, true);
+  end.view.setUint16(10, files.length, true);
+  end.view.setUint32(12, centralBytes.length, true);
+  end.view.setUint32(16, centralOffset, true);
+
+  localParts.push(centralBytes, end.bytes);
+  return concatBytes(localParts).buffer;
+}
+
+async function glbToTexturedObjZip(buffer) {
+  return zipFiles(await glbToTexturedObjFiles(buffer));
+}
+
+async function glbToPngTextureZip(buffer) {
+  return zipFiles(await glbToPngTextureFiles(buffer));
+}
+
 async function convert(buffer, format) {
   const mod = await getMeshyModule();
   const result = mod.processMeshyFile(new Uint8Array(buffer));
@@ -281,6 +660,8 @@ async function convert(buffer, format) {
   const glb = result.data instanceof Uint8Array ? result.data.buffer.slice(result.data.byteOffset, result.data.byteOffset + result.data.byteLength) : result.data;
   if (format === "glb") return glb;
   if (format === "obj") return glbToObj(glb);
+  if (format === "obj-textured") return glbToTexturedObjZip(glb);
+  if (format === "textures-png") return glbToPngTextureZip(glb);
   if (format === "stl") return glbToBinaryStl(glb);
   throw new Error(`Unsupported output format: ${format}`);
 }

@@ -8,6 +8,14 @@ const sandboxFrame = document.getElementById("sandbox");
 
 let jobId = 0;
 
+const outputFormats = {
+  stl: { label: "STL", extension: "stl", mime: "model/stl" },
+  obj: { label: "OBJ", extension: "obj", mime: "model/obj" },
+  "obj-textured": { label: "OBJ ZIP", extension: "zip", mime: "application/zip" },
+  "textures-png": { label: "PNG TEXTURES", extension: "zip", mime: "application/zip" },
+  glb: { label: "GLB", extension: "glb", mime: "model/gltf-binary" },
+};
+
 function setBusy(isBusy, text) {
   scanButton.disabled = isBusy;
   convertButton.disabled = isBusy;
@@ -147,7 +155,7 @@ async function scan() {
 scanButton.addEventListener("click", scan);
 
 formatSelect.addEventListener("change", () => {
-  convertButton.textContent = `Download ${formatSelect.value.toUpperCase()}`;
+  convertButton.textContent = `Download ${outputFormats[formatSelect.value]?.label || formatSelect.value.toUpperCase()}`;
 });
 
 convertButton.addEventListener("click", async () => {
@@ -159,13 +167,13 @@ convertButton.addEventListener("click", async () => {
 
   try {
     const format = formatSelect.value;
+    const outputFormat = outputFormats[format];
     setBusy(true, "Downloading .meshy...");
     const buffer = await fetchArrayBuffer(url);
-    setBusy(true, format === "glb" ? "Decoding GLB..." : `Decoding and converting to ${format.toUpperCase()}...`);
+    setBusy(true, format === "glb" ? "Decoding GLB..." : `Decoding and converting to ${outputFormat.label}...`);
     const output = await convertInSandbox(buffer, format);
-    const mimeTypes = { stl: "model/stl", obj: "model/obj", glb: "model/gltf-binary" };
-    await downloadBlob(new Blob([output], { type: mimeTypes[format] }), `${baseNameFromUrl(url)}.${format}`);
-    statusEl.textContent = `${format.toUpperCase()} generated.`;
+    await downloadBlob(new Blob([output], { type: outputFormat.mime }), `${baseNameFromUrl(url)}.${outputFormat.extension}`);
+    statusEl.textContent = `${outputFormat.label} generated.`;
   } catch (error) {
     statusEl.textContent = `Error: ${error.message}`;
   } finally {
