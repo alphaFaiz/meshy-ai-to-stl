@@ -516,7 +516,9 @@ async function glbToTexturedObjFiles(buffer) {
       if (texcoords) {
         for (let i = 0; i < texcoords.count; i++) {
           const uv = transformTextureCoord(texcoords.get(i), textureInfo);
-          objLines.push(`vt ${uv[0]} ${uv[1]}`);
+          // glTF measures V from the top of the image, OBJ from the bottom, so flip V
+          // (after the texture transform has been applied in glTF space).
+          objLines.push(`vt ${uv[0]} ${1 - uv[1]}`);
         }
       }
 
